@@ -46,6 +46,7 @@ betaq/
     research_report.md     # Full paper-quality writeup with benchmarks
     debugging_narrative.md # The compound error bug debugging story
   test/
+    test_quantize.py      # Unit tests for Q8_0 and RQ4 block quantization
     test_rq4_quality.py   # Quality stress test against a running llama-server
 ```
 
@@ -91,7 +92,7 @@ python betaq/python/quantize_rq4.py \
     --output model-rq4.gguf
 ```
 
-The quantizer skips embeddings, norms, biases, and small tensors (< 1024 elements). Only 2D weight matrices are quantized.
+The quantizer uses **hybrid quantization**: 2D weight matrices get RQ4 (4-bit codebook), while embedding tensors (`token_embd`, `per_layer_token_embd`, etc.) get Q8_0 -- because llama.cpp's `get_rows` (embedding lookup) doesn't support RQ4 dequantization. Norms, biases, and small tensors (< 1024 elements) are copied as-is.
 
 ### 4. Run inference
 
