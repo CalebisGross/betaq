@@ -11,7 +11,6 @@ Usage:
 
 import argparse
 import struct
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -50,7 +49,22 @@ RQ4_CODEBOOK_INT8 = np.array(
 )
 
 QK_RQ4 = 32
+QK_Q8_0 = 32
 GGML_TYPE_RQ4 = 42
+
+
+def quantize_block_q8_0(block: np.ndarray) -> bytes:
+    """Quantize a block of 32 floats to Q8_0 format.
+
+    Returns 34 bytes: f16 scale (2 bytes) + int8 quants[32] (32 bytes).
+    """
+    assert len(block) == QK_Q8_0
+    amax = np.abs(block).max()
+    if amax < 1e-10:
+        return struct.pack('<e', 0.0) + bytes(QK_Q8_0)
+    scale = amax / 127.0
+    quants = np.round(block / scale).clip(-128, 127).astype(np.int8)
+    return struct.pack('<e', scale) + quants.tobytes()
 
 
 def quantize_block_rq4(block: np.ndarray) -> tuple[float, bytes]:
@@ -142,7 +156,9 @@ def main():
                 writer.add_float32(name, float(field.parts[-1][0]))
         elif ft == gguf.GGUFValueType.BOOL:
             if len(field.types) > 1 and field.types[0] == gguf.GGUFValueType.ARRAY:
-                vals = [int(field.parts[idx][0]) for idx in field.data]
+                # Must use bool() not int() — int changes GGUF type from BOOL to INT32,
+                # which breaks llama.cpp's sliding window pattern parsing
+                vals = [bool(field.parts[idx][0]) for idx in field.data]
                 writer.add_array(name, vals)
             else:
                 writer.add_bool(name, bool(field.parts[-1][0]))
@@ -152,24 +168,28 @@ def main():
             writer.add_float64(name, float(field.parts[-1][0]))
 
     # Skip patterns — don't quantize these
-    skip_patterns = ("norm", "gate_bias", "rope_freqs", "token_embd",
-                     "output_norm", "per_layer_token_embd", "per_layer_model_proj",
+    skip_patterns = ("norm", "gate_bias", "rope_freqs",
+                     "output_norm", "per_layer_model_proj",
                      "per_layer_proj_norm", "spoke.norm")
 
-    quantized = 0
+    # Embedding patterns — use Q8_0 instead of RQ4 (get_rows doesn't support RQ4)
+    embed_patterns = ("embd", "embed")
+
+    quantized_rq4 = 0
+    quantized_q8 = 0
     copied = 0
     total_f16_bytes = 0
     total_rq4_bytes = 0
+    total_q8_bytes = 0
 
     print(f"\n  Quantizing...")
 
     for t in reader.tensors:
         data = np.array(t.data)
 
-        # Quantize all 2D weight matrices. Skip norms, biases, embeddings,
-        # and individual (non-fused) adapter matrices (e.g. spoke adapters).
         is_individual_spoke = ("spoke" in t.name and "fused" not in t.name
                                and ("w_down" in t.name or "w_up" in t.name))
+        is_embedding = any(p in t.name for p in embed_patterns)
         should_quantize = (
             len(t.shape) == 2
             and t.n_elements >= args.min_elements
@@ -177,37 +197,56 @@ def main():
             and not is_individual_spoke
         )
 
-        if should_quantize:
+        if should_quantize and is_embedding:
+            # Hybrid path: Q8_0 for embeddings (used by get_rows, not mul_mat)
             W = data.astype(np.float32).reshape(-1)
             n_elements = len(W)
 
-            # Pad to multiple of QK_RQ4
+            if n_elements % QK_Q8_0 != 0:
+                pad = QK_Q8_0 - (n_elements % QK_Q8_0)
+                W = np.pad(W, (0, pad))
+            n_blocks = len(W) // QK_Q8_0
+
+            q8_data = bytearray()
+            for b in range(n_blocks):
+                block = W[b * QK_Q8_0:(b + 1) * QK_Q8_0]
+                q8_data += quantize_block_q8_0(block)
+
+            q8_array = np.frombuffer(bytes(q8_data), dtype=np.uint8)
+            ne0, ne1 = int(t.shape[0]), int(t.shape[1])
+            q8_view = q8_array.view(np.int8)
+            writer.add_tensor(t.name, q8_view,
+                              raw_shape=[ne1, ne0],
+                              raw_dtype=gguf.GGMLQuantizationType.Q8_0)
+
+            f16_size = n_elements * 2
+            q8_size = len(q8_data)
+            total_f16_bytes += f16_size
+            total_q8_bytes += q8_size
+            print(f"    {t.name}: {t.shape[0]}x{t.shape[1]} -> Q8_0 ({f16_size/q8_size:.1f}x)")
+            quantized_q8 += 1
+
+        elif should_quantize:
+            # Standard path: RQ4 for weight matrices (used by mul_mat)
+            W = data.astype(np.float32).reshape(-1)
+            n_elements = len(W)
+
             if n_elements % QK_RQ4 != 0:
                 pad = QK_RQ4 - (n_elements % QK_RQ4)
                 W = np.pad(W, (0, pad))
             n_blocks = len(W) // QK_RQ4
 
-            # Quantize each block
             rq4_data = bytearray()
             for b in range(n_blocks):
                 block = W[b * QK_RQ4:(b + 1) * QK_RQ4]
                 scale, packed = quantize_block_rq4(block)
-                # block_rq4: ggml_half d (2 bytes) + uint8 qs[16] (16 bytes) = 18 bytes
                 rq4_data += struct.pack('<e', scale)  # f16 scale
                 rq4_data += packed
 
             rq4_array = np.frombuffer(bytes(rq4_data), dtype=np.uint8)
 
-            # Write as raw tensor with RQ4 type.
-            # gguf-py's add_tensor_info calls quant_shape_from_byte_shape ONLY
-            # when tensor_dtype == np.uint8. To pass the correct logical shape
-            # [ne0, ne1] directly and bypass that conversion, we view the data
-            # as int8 (same bytes, different dtype) and pass raw_shape.
-            # raw_shape must be in numpy (outer, inner) order — gguf-py reverses
-            # it to GGUF (inner, outer) when writing. t.shape from gguf-py reader
-            # is already (inner=ne[0], outer=ne[1]), so reverse it for raw_shape.
             ne0, ne1 = int(t.shape[0]), int(t.shape[1])
-            rq4_view = rq4_array.view(np.int8)  # same bytes, but dtype != uint8
+            rq4_view = rq4_array.view(np.int8)
             writer.add_tensor(t.name, rq4_view,
                               raw_shape=[ne1, ne0],
                               raw_dtype=gguf.GGMLQuantizationType.RQ4)
@@ -217,18 +256,24 @@ def main():
             total_f16_bytes += f16_size
             total_rq4_bytes += rq4_size
 
-            if quantized < 5:
+            if quantized_rq4 < 5:
                 rows, cols = t.shape
-                print(f"    {t.name}: {rows}x{cols} -> {f16_size/rq4_size:.1f}x")
-            quantized += 1
+                print(f"    {t.name}: {rows}x{cols} -> RQ4 ({f16_size/rq4_size:.1f}x)")
+            quantized_rq4 += 1
         else:
             writer.add_tensor(t.name, data)
             copied += 1
 
-    print(f"\n  Quantized: {quantized} matrices")
+    print(f"\n  Quantized (RQ4): {quantized_rq4} weight matrices")
+    print(f"  Quantized (Q8_0): {quantized_q8} embedding tensors")
     print(f"  Copied:    {copied} tensors")
-    if total_rq4_bytes > 0:
-        print(f"  Weight compression: {total_f16_bytes/1e6:.0f} MB -> {total_rq4_bytes/1e6:.0f} MB ({total_f16_bytes/total_rq4_bytes:.1f}x)")
+    total_quant_bytes = total_rq4_bytes + total_q8_bytes
+    if total_quant_bytes > 0:
+        print(f"  Compression: {total_f16_bytes/1e6:.0f} MB -> {total_quant_bytes/1e6:.0f} MB ({total_f16_bytes/total_quant_bytes:.1f}x)")
+        if total_rq4_bytes > 0:
+            print(f"    RQ4 weights: {total_rq4_bytes/1e6:.0f} MB")
+        if total_q8_bytes > 0:
+            print(f"    Q8_0 embeddings: {total_q8_bytes/1e6:.0f} MB")
 
     print(f"\n  Writing GGUF...")
     writer.write_header_to_file()
